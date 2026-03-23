@@ -1,0 +1,9 @@
+{
+  "name": "Relu3 Clean Residual + BigramHash + SmearGate",
+  "val_loss": 0.0,
+  "bytes_total": 0,
+  "blurb": "TBD after 8xH100 runs. Cleaner residual block with relu3 on top of a competitive int5/int6 + BigramHash + SmearGate + SWA scaffold.",
+  "author": "Youssef Elshaarawy",
+  "github_id": "YoussefElshaarawy",
+  "date": "2026-03-23"
+}
