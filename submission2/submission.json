@@ -1,0 +1,9 @@
+{
+  "name": "Relu3 Clean Residual + BigramHash + SmearGate Fast Cut",
+  "val_loss": 0.0,
+  "bytes_total": 0,
+  "blurb": "TBD after 8xH100 runs. Same relu3 submission scaffold, but with percentage-based workload cuts for a much faster training loop.",
+  "author": "Youssef Elshaarawy",
+  "github_id": "YoussefElshaarawy",
+  "date": "2026-03-23"
+}
