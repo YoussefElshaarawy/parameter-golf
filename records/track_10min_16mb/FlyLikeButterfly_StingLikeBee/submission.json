@@ -1,0 +1,9 @@
+{
+  "name": "FlyLikeButterfly_StingLikeBee",
+  "val_loss": 0.0,
+  "bytes_total": 0,
+  "blurb": "Fast clean-brain scaffold with periodic deep sting phases: relu3, no skip path, no learned residual scales, no bigram, no smear, and a strict 16 MB export guard.",
+  "author": "Youssef Elshaarawy",
+  "github_id": "YoussefElshaarawy",
+  "date": "2026-03-23"
+}
