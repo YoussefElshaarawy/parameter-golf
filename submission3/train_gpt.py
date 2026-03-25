@@ -72,6 +72,8 @@ class Hyperparameters:
     fast_eval_batch_frac = float(os.environ.get("FAST_EVAL_BATCH_FRAC", "0.25"))
 
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", _scaled_int(base_train_seq_len, fast_seq_frac, minimum=128)))
+    early_train_seq_len = int(os.environ.get("EARLY_TRAIN_SEQ_LEN", "0"))
+    early_train_steps = int(os.environ.get("EARLY_TRAIN_STEPS", "0"))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", _aligned_tokens(base_train_batch_tokens, fast_batch_frac, train_seq_len)))
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", _aligned_tokens(base_val_batch_size, fast_val_batch_frac, train_seq_len)))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 0))
@@ -262,16 +264,18 @@ def eval_val(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
     max_eval_seqs: int | None = None,
+    eval_seq_len: int | None = None,
 ) -> tuple[float, float]:
+    seq_len = eval_seq_len or args.train_seq_len
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
+    if local_batch_tokens < seq_len:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence per rank; "
             f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={seq_len}"
         )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    local_batch_seqs = local_batch_tokens // seq_len
+    total_seqs = (val_tokens.numel() - 1) // seq_len
     if max_eval_seqs is not None and max_eval_seqs > 0:
         total_seqs = min(total_seqs, max_eval_seqs)
     seq_start = (total_seqs * rank) // world_size
@@ -283,11 +287,11 @@ def eval_val(
     with torch.inference_mode():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
+            raw_start = batch_seq_start * seq_len
+            raw_end = batch_seq_end * seq_len + 1
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
+            x = local[:-1].reshape(-1, seq_len)
+            y = local[1:].reshape(-1, seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
@@ -1132,6 +1136,8 @@ def main() -> None:
             f"fast_eval_batch_frac={args.fast_eval_batch_frac} "
             f"proxy_val_every={args.proxy_val_every} "
             f"proxy_val_max_seqs={args.proxy_val_max_seqs} "
+            f"early_train_seq_len={args.early_train_seq_len} "
+            f"early_train_steps={args.early_train_steps} "
             f"val_batch_size={args.val_batch_size} "
             f"eval_batch_seqs={args.eval_batch_seqs} "
             f"max_submission_bytes={args.max_submission_bytes}"
@@ -1148,6 +1154,11 @@ def main() -> None:
 
     # DATA LOADER & MODEL WARMUP
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    def current_train_seq_len(step_idx: int) -> int:
+        if args.early_train_seq_len > 0 and args.early_train_steps > 0 and step_idx < args.early_train_steps:
+            return args.early_train_seq_len
+        return args.train_seq_len
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1171,11 +1182,12 @@ def main() -> None:
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
         for warmup_step in range(args.warmup_steps):
+            warmup_seq_len = current_train_seq_len(0)
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                x, y = train_loader.next_batch(args.train_batch_tokens, warmup_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -1212,6 +1224,7 @@ def main() -> None:
             val_loss, val_bpb = eval_val(
                 args, model, rank, world_size, device, grad_accum_steps,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                eval_seq_len=args.train_seq_len,
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
@@ -1230,12 +1243,13 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        train_seq_len = current_train_seq_len(step)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(args.train_batch_tokens, train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
@@ -1286,10 +1300,12 @@ def main() -> None:
                 args, model, rank, world_size, device, grad_accum_steps,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
                 max_eval_seqs=args.proxy_val_max_seqs,
+                eval_seq_len=args.train_seq_len,
             )
             log0(
                 f"step:{step}/{args.iterations} proxy_val_loss:{proxy_val_loss:.4f} proxy_val_bpb:{latest_proxy_val_bpb:.4f} "
                 f"proxy_eval_seqs:{args.proxy_val_max_seqs} "
+                f"train_seq_len_current:{train_seq_len} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / step:.2f}ms"
             )
             torch.cuda.synchronize()
@@ -1300,6 +1316,7 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"proxy_val_bpb:{proxy_bpb_str} "
+                f"train_seq_len_current:{train_seq_len} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
@@ -1391,6 +1408,7 @@ def main() -> None:
         q_val_loss, q_val_bpb = eval_val(
             args, model, rank, world_size, device, grad_accum_steps,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            eval_seq_len=args.train_seq_len,
         )
     torch.cuda.synchronize()
     log0(
