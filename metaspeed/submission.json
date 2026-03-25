@@ -1,0 +1,9 @@
+{
+  "name": "metaspeed",
+  "val_loss": 0.0,
+  "bytes_total": 0,
+  "blurb": "Extreme throughput-first fork of metastep: shorter context, smaller batch, lighter MTP, and faster screening defaults for 400-step black-swan tests.",
+  "author": "Youssef Elshaarawy",
+  "github_id": "YoussefElshaarawy",
+  "date": "2026-03-23"
+}
