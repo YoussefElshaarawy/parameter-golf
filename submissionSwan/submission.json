@@ -1,0 +1,9 @@
+{
+  "name": "submissionSwan",
+  "val_loss": 0.0,
+  "bytes_total": 0,
+  "blurb": "Aggressive submission3 variant with training-only EMA distillation for black-swan bpb swings while keeping the exported model unchanged.",
+  "author": "Youssef Elshaarawy",
+  "github_id": "YoussefElshaarawy",
+  "date": "2026-03-23"
+}
