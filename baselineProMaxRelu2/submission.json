@@ -1,0 +1,9 @@
+{
+  "name": "baselineProMaxRelu2",
+  "val_loss": 0.0,
+  "bytes_total": 0,
+  "blurb": "Fast readable baselineProMax ablation that keeps the cleaned architecture but swaps the MLP back to relu^2 for isolated 1xH100 screening.",
+  "author": "Youssef Elshaarawy",
+  "github_id": "YoussefElshaarawy",
+  "date": "2026-03-25"
+}
