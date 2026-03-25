@@ -75,6 +75,8 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", _aligned_tokens(base_train_batch_tokens, fast_batch_frac, train_seq_len)))
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", _aligned_tokens(base_val_batch_size, fast_val_batch_frac, train_seq_len)))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 0))
+    proxy_val_every = int(os.environ.get("PROXY_VAL_EVERY", 100))
+    proxy_val_max_seqs = int(os.environ.get("PROXY_VAL_MAX_SEQS", 512))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -259,6 +261,7 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    max_eval_seqs: int | None = None,
 ) -> tuple[float, float]:
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
@@ -269,6 +272,8 @@ def eval_val(
         )
     local_batch_seqs = local_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    if max_eval_seqs is not None and max_eval_seqs > 0:
+        total_seqs = min(total_seqs, max_eval_seqs)
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -1125,6 +1130,8 @@ def main() -> None:
             f"fast_batch_frac={args.fast_batch_frac} "
             f"fast_val_batch_frac={args.fast_val_batch_frac} "
             f"fast_eval_batch_frac={args.fast_eval_batch_frac} "
+            f"proxy_val_every={args.proxy_val_every} "
+            f"proxy_val_max_seqs={args.proxy_val_max_seqs} "
             f"val_batch_size={args.val_batch_size} "
             f"eval_batch_seqs={args.eval_batch_seqs} "
             f"max_submission_bytes={args.max_submission_bytes}"
@@ -1190,6 +1197,7 @@ def main() -> None:
     stop_after_step: int | None = None
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
+    latest_proxy_val_bpb: float | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1267,9 +1275,31 @@ def main() -> None:
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
+        should_proxy_validate = (
+            args.proxy_val_every > 0
+            and (step <= 10 or step % args.proxy_val_every == 0 or stop_after_step is not None)
+        )
+        if should_proxy_validate:
+            torch.cuda.synchronize()
+            training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            proxy_val_loss, latest_proxy_val_bpb = eval_val(
+                args, model, rank, world_size, device, grad_accum_steps,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                max_eval_seqs=args.proxy_val_max_seqs,
+            )
+            log0(
+                f"step:{step}/{args.iterations} proxy_val_loss:{proxy_val_loss:.4f} proxy_val_bpb:{latest_proxy_val_bpb:.4f} "
+                f"proxy_eval_seqs:{args.proxy_val_max_seqs} "
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / step:.2f}ms"
+            )
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            approx_training_time_ms = training_time_ms
         if should_log_train:
+            proxy_bpb_str = f"{latest_proxy_val_bpb:.4f}" if latest_proxy_val_bpb is not None else "na"
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"proxy_val_bpb:{proxy_bpb_str} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
