@@ -1,0 +1,9 @@
+{
+  "name": "baselineProMax",
+  "val_loss": 0.0,
+  "bytes_total": 0,
+  "blurb": "Fast readable baseline fork that keeps the starter training loop but uses a cleaner residual architecture and relu^3 MLPs for quick 1xH100 screening runs.",
+  "author": "Youssef Elshaarawy",
+  "github_id": "YoussefElshaarawy",
+  "date": "2026-03-25"
+}
