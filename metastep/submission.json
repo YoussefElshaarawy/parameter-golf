@@ -1,0 +1,9 @@
+{
+  "name": "metastep",
+  "val_loss": 0.0,
+  "bytes_total": 0,
+  "blurb": "submission3 fork with lightweight multi-token prediction heads that densify supervision inside each step while excluding those heads from export.",
+  "author": "Youssef Elshaarawy",
+  "github_id": "YoussefElshaarawy",
+  "date": "2026-03-23"
+}
