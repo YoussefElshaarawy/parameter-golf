@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STAGE="${1:-A}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+DATA_PATH="${DATA_PATH:-${ROOT_DIR}/data/datasets/fineweb10B_sp8192}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-${ROOT_DIR}/data/tokenizers/fineweb_8192_bpe.model}"
+
+if [[ ! -f "${TOKENIZER_PATH}" || ! -d "${DATA_PATH}" ]]; then
+  echo "Missing SP8192 data/tokenizer."
+  echo "Run from repo root on the RunPod box first:"
+  echo "  python3 data/cached_challenge_fineweb.py --variant sp8192"
+  exit 1
+fi
+
+COMMON_ENV=(
+  RUN_ID="${RUN_ID:-topstack_stage_${STAGE}_seed${SEED:-42}}"
+  SEED="${SEED:-42}"
+  DATA_PATH="${DATA_PATH}"
+  TOKENIZER_PATH="${TOKENIZER_PATH}"
+  VOCAB_SIZE=8192
+  NUM_LAYERS="${NUM_LAYERS:-11}"
+  MODEL_DIM="${MODEL_DIM:-512}"
+  NUM_HEADS="${NUM_HEADS:-8}"
+  NUM_KV_HEADS="${NUM_KV_HEADS:-4}"
+  TRAIN_SEQ_LEN="${TRAIN_SEQ_LEN:-2048}"
+  TRAIN_BATCH_TOKENS="${TRAIN_BATCH_TOKENS:-786432}"
+  VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-524288}"
+  MLP_MULT="${MLP_MULT:-4.0}"
+  ACTIVATION_TYPE="${ACTIVATION_TYPE:-relu3}"
+  USE_BIGRAM="${USE_BIGRAM:-0}"
+  USE_SMEAR="${USE_SMEAR:-0}"
+  USE_SKIP_PATH="${USE_SKIP_PATH:-0}"
+  USE_ATTN_SCALE="${USE_ATTN_SCALE:-0}"
+  USE_MLP_SCALE="${USE_MLP_SCALE:-0}"
+  USE_RESID_MIX="${USE_RESID_MIX:-1}"
+  USE_Q_GAIN="${USE_Q_GAIN:-1}"
+  EVAL_STRIDE="${EVAL_STRIDE:-0}"
+  TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-100}"
+  VAL_LOSS_EVERY="${VAL_LOSS_EVERY:-0}"
+  MAX_WALLCLOCK_SECONDS="${MAX_WALLCLOCK_SECONDS:-90}"
+  NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+)
+
+case "${STAGE}" in
+  A|a)
+    EXTRA_ENV=(USE_PARALLEL_RESIDUAL=0 ENABLE_RECURRENCE=0 QK_GAIN_INIT=1.5)
+    ;;
+  B|b)
+    EXTRA_ENV=(USE_PARALLEL_RESIDUAL=1 ENABLE_RECURRENCE=0 QK_GAIN_INIT=1.5)
+    ;;
+  C|c)
+    EXTRA_ENV=(
+      USE_PARALLEL_RESIDUAL=1
+      ENABLE_RECURRENCE=1
+      RECURRENCE_START_FRAC="${RECURRENCE_START_FRAC:-0.35}"
+      RECURRENCE_LOOP_START="${RECURRENCE_LOOP_START:-3}"
+      RECURRENCE_LOOP_END="${RECURRENCE_LOOP_END:-5}"
+      RECURRENCE_REPEATS="${RECURRENCE_REPEATS:-2}"
+      QK_GAIN_INIT=1.5
+    )
+    ;;
+  D|d)
+    EXTRA_ENV=(
+      USE_PARALLEL_RESIDUAL=1
+      ENABLE_RECURRENCE=1
+      RECURRENCE_START_FRAC="${RECURRENCE_START_FRAC:-0.35}"
+      RECURRENCE_LOOP_START="${RECURRENCE_LOOP_START:-3}"
+      RECURRENCE_LOOP_END="${RECURRENCE_LOOP_END:-5}"
+      RECURRENCE_REPEATS="${RECURRENCE_REPEATS:-2}"
+      QK_GAIN_INIT=5.25
+    )
+    ;;
+  *)
+    echo "Usage: $0 {A|B|C|D}"
+    exit 2
+    ;;
+esac
+
+cd "${SCRIPT_DIR}"
+env "${COMMON_ENV[@]}" "${EXTRA_ENV[@]}" bash eval/eval.sh

@@ -89,6 +89,13 @@ class Hyperparameters:
     use_mlp_scale = bool(int(os.environ.get("USE_MLP_SCALE", "0")))
     use_resid_mix = bool(int(os.environ.get("USE_RESID_MIX", "1")))
     use_q_gain = bool(int(os.environ.get("USE_Q_GAIN", "1")))
+    use_parallel_residual = bool(int(os.environ.get("USE_PARALLEL_RESIDUAL", "1")))
+    enable_recurrence = bool(int(os.environ.get("ENABLE_RECURRENCE", "0")))
+    recurrence_start_frac = float(os.environ.get("RECURRENCE_START_FRAC", "0.35"))
+    recurrence_start_step = int(os.environ.get("RECURRENCE_START_STEP", "-1"))
+    recurrence_loop_start = int(os.environ.get("RECURRENCE_LOOP_START", "3"))
+    recurrence_loop_end = int(os.environ.get("RECURRENCE_LOOP_END", "5"))
+    recurrence_repeats = int(os.environ.get("RECURRENCE_REPEATS", "2"))
     use_smear = bool(int(os.environ.get("USE_SMEAR", "1")))
     use_bigram = bool(int(os.environ.get("USE_BIGRAM", "1")))
 
@@ -668,6 +675,7 @@ class Block(nn.Module):
         self.use_resid_mix = args.use_resid_mix
         self.use_attn_scale = args.use_attn_scale
         self.use_mlp_scale = args.use_mlp_scale
+        self.use_parallel_residual = args.use_parallel_residual
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(
@@ -690,6 +698,12 @@ class Block(nn.Module):
         attn_out = self.attn(self.attn_norm(x))
         if self.attn_scale is not None:
             attn_out = self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        if self.use_parallel_residual:
+            mlp_out = self.mlp(self.mlp_norm(x))
+            if self.mlp_scale is not None:
+                mlp_out = self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+            return x + attn_out + mlp_out
+
         x = x + attn_out
         mlp_out = self.mlp(self.mlp_norm(x))
         if self.mlp_scale is not None:
@@ -718,6 +732,11 @@ class GPT(nn.Module):
         use_mlp_scale: bool,
         use_resid_mix: bool,
         use_q_gain: bool,
+        use_parallel_residual: bool,
+        enable_recurrence: bool,
+        recurrence_loop_start: int,
+        recurrence_loop_end: int,
+        recurrence_repeats: int,
         use_smear: bool,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
@@ -734,6 +753,12 @@ class GPT(nn.Module):
         self.use_mlp_scale = use_mlp_scale
         self.use_resid_mix = use_resid_mix
         self.use_q_gain = use_q_gain
+        self.use_parallel_residual = use_parallel_residual
+        self.enable_recurrence = enable_recurrence
+        self.recurrence_active = False
+        self.recurrence_loop_start = max(0, recurrence_loop_start)
+        self.recurrence_loop_end = max(self.recurrence_loop_start, recurrence_loop_end)
+        self.recurrence_repeats = max(1, recurrence_repeats)
         self.use_smear = use_smear
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
@@ -754,12 +779,24 @@ class GPT(nn.Module):
         block_args.use_mlp_scale = use_mlp_scale
         block_args.use_resid_mix = use_resid_mix
         block_args.use_q_gain = use_q_gain
+        block_args.use_parallel_residual = use_parallel_residual
         self.blocks = nn.ModuleList([Block(block_args) for _ in range(num_layers)])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
+
+    def _apply_block(self, x: Tensor, x0: Tensor, block_idx: int) -> Tensor:
+        x = self.blocks[block_idx](x, x0)
+        if (
+            self.enable_recurrence
+            and self.recurrence_active
+            and self.recurrence_loop_start <= block_idx <= self.recurrence_loop_end
+        ):
+            for _ in range(self.recurrence_repeats - 1):
+                x = self.blocks[block_idx](x, x0)
+        return x
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -785,13 +822,13 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self._apply_block(x, x0, i)
             if self.use_skip_path:
                 skips.append(x)
         for i in range(self.num_decoder_layers):
             if self.use_skip_path and skips and self.skip_weights is not None:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self._apply_block(x, x0, self.num_encoder_layers + i)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -813,13 +850,13 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self._apply_block(x, x0, i)
             if self.use_skip_path:
                 skips.append(x)
         for i in range(self.num_decoder_layers):
             if self.use_skip_path and skips and self.skip_weights is not None:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self._apply_block(x, x0, self.num_encoder_layers + i)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1012,6 +1049,11 @@ def main() -> None:
         use_mlp_scale=args.use_mlp_scale,
         use_resid_mix=args.use_resid_mix,
         use_q_gain=args.use_q_gain,
+        use_parallel_residual=args.use_parallel_residual,
+        enable_recurrence=args.enable_recurrence,
+        recurrence_loop_start=args.recurrence_loop_start,
+        recurrence_loop_end=args.recurrence_loop_end,
+        recurrence_repeats=args.recurrence_repeats,
         use_smear=args.use_smear,
         bigram_vocab_size=args.bigram_vocab_size if args.use_bigram else 0,
         bigram_dim=args.bigram_dim,
@@ -1089,6 +1131,10 @@ def main() -> None:
         f" mlp_scale={int(args.use_mlp_scale)}"
         f" resid_mix={int(args.use_resid_mix)}"
         f" q_gain={int(args.use_q_gain)}"
+        f" parallel_residual={int(args.use_parallel_residual)}"
+        f" recurrence={int(args.enable_recurrence)}"
+        f" recurrence_range={args.recurrence_loop_start}-{args.recurrence_loop_end}"
+        f" recurrence_repeats={args.recurrence_repeats}"
         f" smear={int(args.use_smear)}"
         f" bigram={int(args.use_bigram)}"
     )
@@ -1156,6 +1202,18 @@ def main() -> None:
     stop_after_step: int | None = None
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
+    recurrence_start_step = (
+        args.recurrence_start_step
+        if args.recurrence_start_step >= 0
+        else int(args.iterations * args.recurrence_start_frac)
+    )
+    if args.enable_recurrence:
+        log0(
+            f"recurrence_schedule:start_step={recurrence_start_step} "
+            f"start_frac={args.recurrence_start_frac:.3f} "
+            f"range={args.recurrence_loop_start}-{args.recurrence_loop_end} "
+            f"repeats={args.recurrence_repeats}"
+        )
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1185,6 +1243,10 @@ def main() -> None:
                     f"step:{step}/{args.iterations}"
                 )
             break
+
+        if args.enable_recurrence and not base_model.recurrence_active and step >= recurrence_start_step:
+            base_model.recurrence_active = True
+            log0(f"recurrence:enabled step:{step}")
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
@@ -1345,7 +1407,11 @@ def main() -> None:
             f"attn_scale={int(args.use_attn_scale)} "
             f"mlp_scale={int(args.use_mlp_scale)} "
             f"resid_mix={int(args.use_resid_mix)} "
-            f"q_gain={int(args.use_q_gain)}"
+            f"q_gain={int(args.use_q_gain)} "
+            f"parallel_residual={int(args.use_parallel_residual)} "
+            f"recurrence={int(args.enable_recurrence)} "
+            f"recurrence_range={args.recurrence_loop_start}-{args.recurrence_loop_end} "
+            f"recurrence_repeats={args.recurrence_repeats}"
         )
 
     if distributed:
